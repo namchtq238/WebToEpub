@@ -4,7 +4,7 @@ parserFactory.register("global.novelpia.com", () => new GlobalNovelpiaParser());
 
 class GlobalNovelpiaParser extends Parser {
     constructor() {
-        super();
+        super(new GlobalNovelpiaImageCollector());
         this.minimumThrottle = 3000;
     }
 
@@ -104,5 +104,171 @@ class GlobalNovelpiaParser extends Parser {
     cleanInformationNode(node) {
         util.removeChildElementsMatchingSelector(node, "button");
         return node;
+    }
+}
+
+class GlobalNovelpiaImageCollector extends ImageCollector {
+    constructor() {
+        super();
+    }
+
+    async fetchImage(imageInfo, progressIndicator, parentPageUrl) {
+        let initialUrl = this.initialUrlToTry(imageInfo);
+        if (new URL(initialUrl).hostname !== "pv-gn.novelpia.com") {
+            return super.fetchImage(imageInfo, progressIndicator, parentPageUrl);
+        }
+
+        try {
+            this.urlIndex.set(initialUrl, imageInfo.index);
+            let response = await GlobalNovelpiaImageCollector.fetchImageFromTab(initialUrl, parentPageUrl);
+            imageInfo.sourceUrl = response.url;
+            imageInfo.mediaType = response.contentType;
+            imageInfo.arraybuffer = GlobalNovelpiaImageCollector.dataUrlToArrayBuffer(response.dataUrl);
+            this.urlIndex.set(response.url, imageInfo.index);
+            this.fixupInvalidMediaType(imageInfo);
+            {
+                let img = await this.getImageDimensions(imageInfo);
+                await this.runCompression(imageInfo, img);
+            }
+            progressIndicator();
+            this.addToPackList(imageInfo);
+        } catch (error) {
+            this.imagesToPack.push(imageInfo);
+            ErrorLog.log(error);
+        }
+    }
+
+    static async fetchImageFromTab(url, parentPageUrl) {
+        let tabId = GlobalNovelpiaImageCollector.extractTabIdFromQueryParameter();
+        if (tabId == null) {
+            throw new Error("Unable to fetch Novelpia image: no source tab id found");
+        }
+        await GlobalNovelpiaImageCollector.navigateTabToChapter(tabId, parentPageUrl);
+
+        let results;
+        try {
+            results = await GlobalNovelpiaImageCollector.executeFetchScript(tabId, url, "MAIN");
+        } catch (error) {
+            results = await GlobalNovelpiaImageCollector.executeFetchScript(tabId, url);
+        }
+        let result = results?.[0]?.result;
+        if (result?.error != null) {
+            throw new Error(result.error);
+        }
+        if (result?.status !== 200) {
+            throw new Error(`Fetch of Novelpia image '${url}' failed with network error ${result?.status}`);
+        }
+        return result;
+    }
+
+    static async navigateTabToChapter(tabId, pageUrl) {
+        let tab = await chrome.tabs.get(tabId);
+        if (!GlobalNovelpiaImageCollector.isTabAtUrl(tab, pageUrl)) {
+            let waitForLoad = GlobalNovelpiaImageCollector.waitForTabLoad(tabId, pageUrl);
+            await chrome.tabs.update(tabId, {url: pageUrl});
+            await waitForLoad;
+        } else if (tab.status !== "complete") {
+            await GlobalNovelpiaImageCollector.waitForTabLoad(tabId, pageUrl);
+        }
+    }
+
+    static waitForTabLoad(tabId, expectedUrl) {
+        return new Promise((resolve) => {
+            let complete = false;
+            let timeoutId = null;
+            let finish = () => {
+                if (!complete) {
+                    complete = true;
+                    clearTimeout(timeoutId);
+                    chrome.tabs.onUpdated.removeListener(listener);
+                    resolve();
+                }
+            };
+            let listener = (updatedTabId, changeInfo, tab) => {
+                if (updatedTabId === tabId
+                    && changeInfo.status === "complete"
+                    && GlobalNovelpiaImageCollector.isTabAtUrl(tab, expectedUrl)) {
+                    finish();
+                }
+            };
+            timeoutId = setTimeout(finish, 20000);
+            chrome.tabs.onUpdated.addListener(listener);
+            chrome.tabs.get(tabId, (tab) => {
+                if (tab?.status === "complete"
+                    && GlobalNovelpiaImageCollector.isTabAtUrl(tab, expectedUrl)) {
+                    finish();
+                }
+            });
+        });
+    }
+
+    static isTabAtUrl(tab, expectedUrl) {
+        if (tab?.url == null) {
+            return false;
+        }
+        return util.normalizeUrlForCompare(tab.url) === util.normalizeUrlForCompare(expectedUrl);
+    }
+
+    static executeFetchScript(tabId, url, world) {
+        let options = {
+            target: {tabId: tabId},
+            args: [url],
+            func: async (imageUrl) => {
+                try {
+                    let sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+                    for (let i = 0; i < 120; ++i) {
+                        let image = [...document.images]
+                            .find((img) => img.src === imageUrl || img.currentSrc === imageUrl);
+                        if (image != null) {
+                            if (image.complete && 0 < image.naturalWidth) {
+                                break;
+                            }
+                            await new Promise((resolve) => {
+                                image.addEventListener("load", resolve, {once: true});
+                                image.addEventListener("error", resolve, {once: true});
+                                setTimeout(resolve, 1000);
+                            });
+                            break;
+                        }
+                        await sleep(250);
+                    }
+                    let response = await fetch(imageUrl, {credentials: "include"});
+                    let blob = await response.blob();
+                    let dataUrl = await new Promise((resolve, reject) => {
+                        let reader = new FileReader();
+                        reader.onload = () => resolve(reader.result);
+                        reader.onerror = () => reject(reader.error);
+                        reader.readAsDataURL(blob);
+                    });
+                    return {
+                        status: response.status,
+                        url: response.url,
+                        contentType: response.headers.get("content-type") ?? blob.type,
+                        dataUrl: dataUrl
+                    };
+                } catch (error) {
+                    return {error: error.message};
+                }
+            }
+        };
+        if (world != null) {
+            options.world = world;
+        }
+        return chrome.scripting.executeScript(options);
+    }
+
+    static extractTabIdFromQueryParameter() {
+        let tabId = new URLSearchParams(window.location.search).get("id");
+        return util.isNullOrEmpty(tabId) ? null : parseInt(tabId, 10);
+    }
+
+    static dataUrlToArrayBuffer(dataUrl) {
+        let base64 = dataUrl.substring(dataUrl.indexOf(",") + 1);
+        let binary = atob(base64);
+        let bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; ++i) {
+            bytes[i] = binary.charCodeAt(i);
+        }
+        return bytes.buffer;
     }
 }
